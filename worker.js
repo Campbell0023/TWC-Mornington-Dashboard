@@ -87,15 +87,29 @@ function xeroSectionCols(section, nCols) {
   return out;
 }
 /* Proposes wage/super accounts by keyword; the owner CONFIRMS the exact list
-   at reconciliation (kpi-spec.md rule 5 / capability-matrix.md, Xero). */
+   at reconciliation (kpi-spec.md rule 5 / capability-matrix.md, Xero).
+   NOTE (deviation, marked per CLAUDE.md rule 3 - confirmed with the owner
+   2026-07-24): this venue's Xero books Wages and Superannuation INSIDE Cost
+   of Sales, not Operating Expenses. kpi-spec.md's Profit formula
+   (revenue - cogs - wagesSuper - overheads) assumes wages sit outside Cost of
+   Sales; here they don't, so a literal Cost of Sales total would double-count
+   those dollars once in `cogs` and again in `wagesSuper`, understating Profit.
+   Fix: wage/super lines are matched WHEREVER they sit (Cost of Sales or
+   Operating Expenses) and pulled out of `cogs` before it's returned, so
+   Profit adds up correctly. The Cost of goods card therefore shows Cost of
+   Sales MINUS wages/super (stock and materials only) rather than Xero's raw
+   Cost of Sales total - reconcile it against Cost of Sales minus Wages minus
+   Superannuation, not the Cost of Sales total on its own. Wage % still shows
+   the full wages+super figure, matching Xero to the cent. */
 const XERO_WAGE_KEYWORDS = /wages|salaries|superannuation|super|payroll|annual leave|long service|workcover/i;
 function xeroParsePL(reportJson, nCols) {
   const report = reportJson && reportJson.Reports && reportJson.Reports[0];
   const rows = (report && report.Rows) || [];
   const revenue = new Array(nCols).fill(0);
-  const cogs = new Array(nCols).fill(0);
+  const cogsRaw = new Array(nCols).fill(0);
   const opex = new Array(nCols).fill(0);
-  const wagesSuper = new Array(nCols).fill(0);
+  const wagesInCogs = new Array(nCols).fill(0);
+  const wagesInOpex = new Array(nCols).fill(0);
   const wageLines = new Set();
   for (const r of rows) {
     if (r.RowType !== 'Section') continue;
@@ -106,7 +120,14 @@ function xeroParsePL(reportJson, nCols) {
       for (let i = 0; i < nCols; i++) revenue[i] += vals[i];
     } else if (title.includes('cost of sales') || title.includes('cost of goods')) {
       const vals = xeroSectionCols(r, nCols);
-      for (let i = 0; i < nCols; i++) cogs[i] += vals[i];
+      for (let i = 0; i < nCols; i++) cogsRaw[i] += vals[i];
+      const leaves = []; xeroCollectLeafRows(r.Rows, leaves);
+      for (const l of leaves) {
+        if (XERO_WAGE_KEYWORDS.test(l.label)) {
+          wageLines.add(l.label);
+          for (let i = 0; i < nCols; i++) wagesInCogs[i] += xeroCellNum(l.cells[1 + i] && l.cells[1 + i].Value);
+        }
+      }
     } else if (title.includes('operating expenses') || title === 'expenses' || title.includes('less operating')) {
       const vals = xeroSectionCols(r, nCols);
       for (let i = 0; i < nCols; i++) opex[i] += vals[i];
@@ -114,12 +135,14 @@ function xeroParsePL(reportJson, nCols) {
       for (const l of leaves) {
         if (XERO_WAGE_KEYWORDS.test(l.label)) {
           wageLines.add(l.label);
-          for (let i = 0; i < nCols; i++) wagesSuper[i] += xeroCellNum(l.cells[1 + i] && l.cells[1 + i].Value);
+          for (let i = 0; i < nCols; i++) wagesInOpex[i] += xeroCellNum(l.cells[1 + i] && l.cells[1 + i].Value);
         }
       }
     }
   }
-  const overheads = opex.map((v, i) => v - wagesSuper[i]);
+  const cogs = cogsRaw.map((v, i) => v - wagesInCogs[i]);
+  const wagesSuper = wagesInCogs.map((v, i) => v + wagesInOpex[i]);
+  const overheads = opex.map((v, i) => v - wagesInOpex[i]);
   return { revenue, cogs, wagesSuper, overheads, wageLines: Array.from(wageLines) };
 }
 function xeroMonthBounds(mo) {
