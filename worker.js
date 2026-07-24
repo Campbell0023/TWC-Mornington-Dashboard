@@ -178,6 +178,81 @@ async function xeroPLColumns(env, h, months) {
   return xeroParsePL(data, months.length);
 }
 
+/* ---------------- Square helpers (pos adapter) ----------------
+   Verified against developer.squareup.com July 2026: production PAT (no
+   OAuth), Square-Version header required, Orders Search with a closed_at
+   date_time_filter + COMPLETED state_filter (matches how Square's own
+   reporting counts a trading day), return_entries:true to keep pages light.
+   Trading-day rollover means "the day" runs [rollover:00, next rollover:00)
+   in the venue's own timezone, so a 2am sale can count to the prior day. */
+const SQUARE_VERSION = '2026-04-21';
+async function squareLocations(env) {
+  const token = env.POS_API_TOKEN || '';
+  const res = await fetch('https://connect.squareup.com/v2/locations', {
+    headers: { Authorization: 'Bearer ' + token, 'Square-Version': SQUARE_VERSION }
+  });
+  if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+  const data = await res.json();
+  return (data && data.locations) || [];
+}
+async function squareCompletedCount(env, locationIds, startAt, endAt) {
+  const token = env.POS_API_TOKEN || '';
+  let cursor, count = 0;
+  do {
+    const body = {
+      return_entries: true,
+      limit: 500,
+      location_ids: locationIds,
+      query: {
+        filter: {
+          date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } },
+          state_filter: { states: ['COMPLETED'] }
+        },
+        sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' }
+      }
+    };
+    if (cursor) body.cursor = cursor;
+    const res = await fetch('https://connect.squareup.com/v2/orders/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token, 'Square-Version': SQUARE_VERSION },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+    const data = await res.json();
+    count += ((data && (data.order_entries || data.orders)) || []).length;
+    cursor = data && data.cursor;
+  } while (cursor);
+  return count;
+}
+/* UTC offset (minutes) of an IANA timezone at a given instant (DST-aware). */
+function tzOffsetMinutes(date, tz) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+  const p = dtf.formatToParts(date).reduce((a, x) => { a[x.type] = x.value; return a; }, {});
+  const asUTC = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+  return (asUTC - date.getTime()) / 60000;
+}
+/* Wall-clock 'YYYY-MM-DD' + 'HH:MM:SS' in tz -> a real UTC instant (ISO). */
+function zonedDateTimeToUTC(dateStr, timeStr, tz) {
+  const naiveUTC = new Date(dateStr + 'T' + timeStr + 'Z').getTime();
+  let offset = tzOffsetMinutes(new Date(naiveUTC), tz);
+  let utcMillis = naiveUTC - offset * 60000;
+  offset = tzOffsetMinutes(new Date(utcMillis), tz); /* refine once for DST edges */
+  utcMillis = naiveUTC - offset * 60000;
+  return new Date(utcMillis).toISOString();
+}
+function addDaysISO(dateStr, days) {
+  const d = new Date(dateStr + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+function tradingWindowUTC(fromDate, toDate, tz, rolloverHours) {
+  const rh = String(rolloverHours || 0).padStart(2, '0') + ':00:00';
+  return { start: zonedDateTimeToUTC(fromDate, rh, tz), end: zonedDateTimeToUTC(addDaysISO(toDate, 1), rh, tz) };
+}
+
 const ADAPTERS = {
 
   /* >>> ADAPTER 1: ACCOUNTING (Xero) - feeds every money figure (kpi-spec.md).
@@ -233,26 +308,51 @@ const ADAPTERS = {
     }
   },
 
-  /* >>> ADAPTER 2: POS
-     Contract:
-       status(env, h)        -> { connected, org, sandbox, lastSync }
-       fetchRange(env, h, q) -> { count }   (completed transactions only;
-                                  exclude voided/cancelled; refunds never
-                                  reduce the count; q.rollover shifts the
-                                  trading-day boundary by that many hours)
-       fetchMonthly(env, h, q)-> { months:[...], count:[...] }
-     NEVER return a dollar figure from the POS.
-     Example (Square): pasted production personal access token (secret
-     POS_API_TOKEN); sandbox sign = token only answers on
-     connect.squareupsandbox.com.
-  */
+  /* >>> ADAPTER 2: POS (Square) - completed transaction count ONLY, never a
+     dollar figure (kpi-spec.md). Pasted production personal access token
+     (Worker secret POS_API_TOKEN) - Square documents PATs as fine for a
+     custom own-account integration, no OAuth dance needed. */
   pos: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    async status(env, h) {
+      const token = env.POS_API_TOKEN;
+      if (!token) return { connected: false };
+      try {
+        const locs = await squareLocations(env);
+        const names = locs.map((l) => l.name).filter(Boolean).join(', ');
+        return { connected: locs.length > 0, org: names || null, sandbox: false };
+      } catch (e) {
+        return { connected: false };
+      }
+    },
+    async fetchRange(env, h, q) {
+      const token = env.POS_API_TOKEN;
+      if (!token) throw new NotConfigured('pos');
+      const locs = await squareLocations(env);
+      const ids = locs.map((l) => l.id);
+      if (!ids.length) return { count: 0 };
+      const win = tradingWindowUTC(q.from, q.to, q.tz || 'Australia/Sydney', q.rollover || 0);
+      const count = await squareCompletedCount(env, ids, win.start, win.end);
+      return { count };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const token = env.POS_API_TOKEN;
+      if (!token) return { months, count: months.map(() => null) };
+      const locs = await squareLocations(env);
+      const ids = locs.map((l) => l.id);
+      const count = [];
+      for (const mo of months) {
+        try {
+          const b = xeroMonthBounds(mo); /* 'YYYY-MM' -> first/last day, reused generically */
+          const win = tradingWindowUTC(b.from, b.to, q.tz || 'Australia/Sydney', q.rollover || 0);
+          count.push(ids.length ? await squareCompletedCount(env, ids, win.start, win.end) : null);
+        } catch (e) { count.push(null); }
+      }
+      return { months, count };
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
