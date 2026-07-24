@@ -101,7 +101,13 @@ function xeroSectionCols(section, nCols) {
    Cost of Sales total - reconcile it against Cost of Sales minus Wages minus
    Superannuation, not the Cost of Sales total on its own. Wage % still shows
    the full wages+super figure, matching Xero to the cent. */
-const XERO_WAGE_KEYWORDS = /wages|salaries|superannuation|super|payroll|annual leave|long service|workcover/i;
+/* "payroll" alone is deliberately excluded: it over-matches "Payroll Tax",
+   which the owner confirmed (2026-07-24) belongs in Overheads, not Wage %. */
+const XERO_WAGE_KEYWORDS = /wages|salaries|superannuation|super|annual leave|long service|workcover/i;
+const XERO_WAGE_EXCLUDE = /payroll tax|fringe benefits tax|fbt/i;
+function xeroIsWageLine(label) {
+  return XERO_WAGE_KEYWORDS.test(label) && !XERO_WAGE_EXCLUDE.test(label);
+}
 function xeroParsePL(reportJson, nCols) {
   const report = reportJson && reportJson.Reports && reportJson.Reports[0];
   const rows = (report && report.Rows) || [];
@@ -123,7 +129,7 @@ function xeroParsePL(reportJson, nCols) {
       for (let i = 0; i < nCols; i++) cogsRaw[i] += vals[i];
       const leaves = []; xeroCollectLeafRows(r.Rows, leaves);
       for (const l of leaves) {
-        if (XERO_WAGE_KEYWORDS.test(l.label)) {
+        if (xeroIsWageLine(l.label)) {
           wageLines.add(l.label);
           for (let i = 0; i < nCols; i++) wagesInCogs[i] += xeroCellNum(l.cells[1 + i] && l.cells[1 + i].Value);
         }
