@@ -56,45 +56,152 @@ import dashboardHtml from './dashboard.html';
    email() handler at the bottom (needs the owner's domain on their Cloudflare
    with Email Routing pointed at this Worker). Ingest auth: the INGEST_TOKEN
    secret; if the owner uploads by hand, that same value is their upload code. */
+
+/* ---------------- Xero P&L helpers (accounting adapter) ----------------
+   Verified against developer.xero.com July 2026: granular scope
+   accounting.reports.profitandloss.read (apps created on/after 2 Mar 2026),
+   token endpoint wants HTTP Basic client auth, report endpoint takes
+   fromDate/toDate (+ timeframe=MONTH & periods<=11 for a batched multi-month
+   pull). Re-check current docs if this build resumes much later. */
+function xeroCellNum(v) {
+  const n = parseFloat(String(v == null ? '' : v).replace(/,/g, ''));
+  return isFinite(n) ? n : 0;
+}
+function xeroCollectLeafRows(rows, out) {
+  for (const r of rows || []) {
+    if (r.RowType === 'Row' && Array.isArray(r.Cells) && r.Cells.length >= 2) {
+      out.push({ label: String(r.Cells[0].Value || ''), cells: r.Cells });
+    } else if (r.RowType === 'Section' && Array.isArray(r.Rows)) {
+      xeroCollectLeafRows(r.Rows, out);
+    }
+  }
+}
+function xeroSectionCols(section, nCols) {
+  const sr = (section.Rows || []).find((r) => r.RowType === 'SummaryRow');
+  if (sr && Array.isArray(sr.Cells) && sr.Cells.length >= 1 + nCols) {
+    return Array.from({ length: nCols }, (_, i) => xeroCellNum(sr.Cells[1 + i].Value));
+  }
+  const leaves = []; xeroCollectLeafRows(section.Rows, leaves);
+  const out = new Array(nCols).fill(0);
+  for (const l of leaves) for (let i = 0; i < nCols; i++) out[i] += xeroCellNum(l.cells[1 + i] && l.cells[1 + i].Value);
+  return out;
+}
+/* Proposes wage/super accounts by keyword; the owner CONFIRMS the exact list
+   at reconciliation (kpi-spec.md rule 5 / capability-matrix.md, Xero). */
+const XERO_WAGE_KEYWORDS = /wages|salaries|superannuation|super|payroll|annual leave|long service|workcover/i;
+function xeroParsePL(reportJson, nCols) {
+  const report = reportJson && reportJson.Reports && reportJson.Reports[0];
+  const rows = (report && report.Rows) || [];
+  const revenue = new Array(nCols).fill(0);
+  const cogs = new Array(nCols).fill(0);
+  const opex = new Array(nCols).fill(0);
+  const wagesSuper = new Array(nCols).fill(0);
+  const wageLines = new Set();
+  for (const r of rows) {
+    if (r.RowType !== 'Section') continue;
+    const title = String(r.Title || '').trim().toLowerCase();
+    if (title === 'other income') continue; /* trading income only - kpi-spec.md */
+    if (title === 'revenue' || (title.includes('income') && !title.includes('other'))) {
+      const vals = xeroSectionCols(r, nCols);
+      for (let i = 0; i < nCols; i++) revenue[i] += vals[i];
+    } else if (title.includes('cost of sales') || title.includes('cost of goods')) {
+      const vals = xeroSectionCols(r, nCols);
+      for (let i = 0; i < nCols; i++) cogs[i] += vals[i];
+    } else if (title.includes('operating expenses') || title === 'expenses' || title.includes('less operating')) {
+      const vals = xeroSectionCols(r, nCols);
+      for (let i = 0; i < nCols; i++) opex[i] += vals[i];
+      const leaves = []; xeroCollectLeafRows(r.Rows, leaves);
+      for (const l of leaves) {
+        if (XERO_WAGE_KEYWORDS.test(l.label)) {
+          wageLines.add(l.label);
+          for (let i = 0; i < nCols; i++) wagesSuper[i] += xeroCellNum(l.cells[1 + i] && l.cells[1 + i].Value);
+        }
+      }
+    }
+  }
+  const overheads = opex.map((v, i) => v - wagesSuper[i]);
+  return { revenue, cogs, wagesSuper, overheads, wageLines: Array.from(wageLines) };
+}
+function xeroMonthBounds(mo) {
+  const [y, m] = mo.split('-').map(Number);
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return { from: mo + '-01', to: mo + '-' + String(lastDay).padStart(2, '0') };
+}
+async function xeroTenantId(env, h) {
+  const tokens = await h.getTokens();
+  if (tokens && tokens.tenantId) return tokens.tenantId;
+  const conns = await h.fetchJson('https://api.xero.com/connections', { headers: { Accept: 'application/json' } });
+  if (!Array.isArray(conns) || !conns.length) { const e = new Error('no Xero connection'); e.status = 401; throw e; }
+  const c = conns[0];
+  await h.saveTokens({ ...(tokens || {}), tenantId: c.tenantId, tenantName: c.tenantName });
+  return c.tenantId;
+}
+/* One call, up to 12 columns (fromDate..toDate, MONTH timeframe, periods<=11
+   preceding the toDate period - stays under Xero's 12-column cap). Columns
+   read left-to-right chronological, matching the requested month order. */
+async function xeroPLColumns(env, h, months) {
+  const tenantId = await xeroTenantId(env, h);
+  const first = xeroMonthBounds(months[0]).from;
+  const last = xeroMonthBounds(months[months.length - 1]).to;
+  let url = 'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=' + first + '&toDate=' + last + '&standardLayout=true';
+  if (months.length > 1) url += '&timeframe=MONTH&periods=' + (months.length - 1);
+  const data = await h.fetchJson(url, { headers: { Accept: 'application/json', 'Xero-Tenant-Id': tenantId } });
+  return xeroParsePL(data, months.length);
+}
+
 const ADAPTERS = {
 
-  /* >>> ADAPTER 1: ACCOUNTING (connect this FIRST - it feeds most of the board)
-     Contract:
-       auth: 'oauth' with the oauth{} block filled, or 'token' for a pasted key
-       status(env, h)        -> { connected, org, sandbox, lastSync }
-       fetchRange(env, h, q) -> { revenue, cogs, wagesSuper, overheads }
-                                 (numbers, ex GST/sales tax, for q.from..q.to
-                                  inclusive, dates in the venue's books)
-       fetchMonthly(env, h, q)-> { months:['YYYY-MM',...], revenue:[...],
-                                   cogs:[...], wagesSuper:[...], overheads:[...] }
-                                 (align arrays to months; null where no data)
-     Map the owner's P&L faithfully: Revenue/Income section (trading income
-     only - Other Income excluded), Cost of Sales section, wage + super
-     accounts, Operating Expenses less wages/super. Do not re-categorise
-     their books. See kpi-spec.md.
-     Example (Xero): oauth with tokenAuth:'basic' (the token endpoint wants
-     HTTP Basic client auth), scopes 'offline_access
-     accounting.reports.profitandloss.read', P&L report endpoint, org name
-     from the connections endpoint, sandbox = tenant name contains
-     'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
-  */
+  /* >>> ADAPTER 1: ACCOUNTING (Xero) - feeds every money figure (kpi-spec.md).
+     Free Starter tier app at developer.xero.com; granular scopes only
+     (accounting.reports.profitandloss.read); token endpoint uses HTTP Basic
+     client auth (tokenAuth:'basic'). Wage/super accounts are keyword-matched
+     then CONFIRMED with the owner at reconciliation - never assumed. */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    configured: true,
+    auth: 'oauth',
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
+      tokenUrl: 'https://identity.xero.com/connect/token',
+      scopes: 'offline_access accounting.reports.profitandloss.read',
+      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
+      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
+      tokenAuth: 'basic'
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+    async status(env, h) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.access_token) return { connected: false };
+      try {
+        await xeroTenantId(env, h);
+        const t2 = await h.getTokens();
+        const name = (t2 && t2.tenantName) || '';
+        return { connected: true, org: name || null, sandbox: /demo company/i.test(name) };
+      } catch (e) {
+        return { connected: false };
+      }
+    },
+    async fetchRange(env, h, q) {
+      /* Single-period pull for an arbitrary (non-month-aligned) range. */
+      const tenantId = await xeroTenantId(env, h);
+      const url = 'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=' + q.from + '&toDate=' + q.to + '&standardLayout=true';
+      const data = await h.fetchJson(url, { headers: { Accept: 'application/json', 'Xero-Tenant-Id': tenantId } });
+      const r = xeroParsePL(data, 1);
+      return { revenue: r.revenue[0], cogs: r.cogs[0], wagesSuper: r.wagesSuper[0], overheads: r.overheads[0] };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const revenue = [], cogs = [], wagesSuper = [], overheads = [];
+      for (let i = 0; i < months.length; i += 12) {
+        const chunk = months.slice(i, i + 12);
+        try {
+          const r = await xeroPLColumns(env, h, chunk);
+          revenue.push(...r.revenue); cogs.push(...r.cogs);
+          wagesSuper.push(...r.wagesSuper); overheads.push(...r.overheads);
+        } catch (e) {
+          for (const _ of chunk) { revenue.push(null); cogs.push(null); wagesSuper.push(null); overheads.push(null); }
+        }
+      }
+      return { months, revenue, cogs, wagesSuper, overheads };
+    }
   },
 
   /* >>> ADAPTER 2: POS
